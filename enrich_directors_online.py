@@ -8,15 +8,49 @@ from typing import Dict, List, Optional
 import pandas as pd
 import aiohttp
 
-INPUT_CSV = "missing_director.csv"
-OUTPUT_CSV = "missing_director.csv"
-PROGRESS_FILE = ".director_enrichment_progress.json"
+INPUT_CSV = "netflix_titles.csv"
+OUTPUT_CSV = "netflix_titles_enriched.csv"
+PROGRESS_FILE = ".credit_enrichment_progress.json"
 MAX_CONCURRENT_REQUESTS = 32
 CHECKPOINT_EVERY = 100
 
 API_URL = "https://www.wikidata.org/w/api.php"
 WIKIPEDIA_API_URL = "https://en.wikipedia.org/w/api.php"
 HEADERS = {"User-Agent": "data-magic-director-enricher/1.0 (local-script)"}
+
+ROLE_CONFIG = {
+    "director": {
+        "tvmaze_roles": ["Director", "Series Director", "Episode Director"],
+        "wikipedia_patterns": [
+            r"\|\s*director\s*=\s*([^\n\|]+)",
+            r"\|\s*directors\s*=\s*([^\n\|]+)",
+            r"\|\s*director1\s*=\s*([^\n\|]+)",
+            r"\|\s*directed by\s*=\s*([^\n\|]+)",
+        ],
+        "wikidata_props": ["P57"],
+        "source_bases": {"tvmaze": 0.95, "wikipedia": 0.9, "wikidata": 0.88},
+    },
+    "creator": {
+        "tvmaze_roles": ["Creator"],
+        "wikipedia_patterns": [
+            r"\|\s*creator\s*=\s*([^\n\|]+)",
+            r"\|\s*creators\s*=\s*([^\n\|]+)",
+        ],
+        "wikidata_props": ["P170"],
+        "source_bases": {"tvmaze": 0.9, "wikipedia": 0.88, "wikidata": 0.84},
+    },
+    "producer": {
+        "tvmaze_roles": ["Producer", "Executive Producer"],
+        "wikipedia_patterns": [
+            r"\|\s*producer\s*=\s*([^\n\|]+)",
+            r"\|\s*producers\s*=\s*([^\n\|]+)",
+            r"\|\s*executive producer\s*=\s*([^\n\|]+)",
+            r"\|\s*executive producers\s*=\s*([^\n\|]+)",
+        ],
+        "wikidata_props": ["P162"],
+        "source_bases": {"tvmaze": 0.86, "wikipedia": 0.84, "wikidata": 0.8},
+    },
+}
 
 
 # Caches
@@ -198,21 +232,9 @@ async def wikipedia_wikitext(session: aiohttp.ClientSession, sem: asyncio.Semaph
     return text
 
 
-def parse_director_from_wikitext(wikitext: str) -> str:
+def parse_wikitext_field(wikitext: str, patterns: List[str]) -> str:
     if not wikitext:
         return ""
-
-    patterns = [
-        r"\|\s*director\s*=\s*([^\n\|]+)",
-        r"\|\s*directors\s*=\s*([^\n\|]+)",
-        r"\|\s*director1\s*=\s*([^\n\|]+)",
-        r"\|\s*directed by\s*=\s*([^\n\|]+)",
-        r"\|\s*creator\s*=\s*([^\n\|]+)",
-        r"\|\s*creators\s*=\s*([^\n\|]+)",
-        r"\|\s*producer\s*=\s*([^\n\|]+)",
-        r"\|\s*producers\s*=\s*([^\n\|]+)",
-        r"\|\s*written by\s*=\s*([^\n\|]+)",
-    ]
     for pattern in patterns:
         match = re.search(pattern, wikitext, flags=re.IGNORECASE)
         if match:
@@ -228,6 +250,10 @@ def parse_director_from_wikitext(wikitext: str) -> str:
                 return value
 
     return ""
+
+
+def parse_wikipedia_role(page_wikitext: str, role: str) -> str:
+    return parse_wikitext_field(page_wikitext, ROLE_CONFIG[role]["wikipedia_patterns"])
 
 
 def normalize_director_value(value: str) -> str:
@@ -264,16 +290,8 @@ def is_valid_director_value(value: str) -> bool:
     return True
 
 
-def director_confidence(source: str, exact_title: bool) -> float:
-    base = {
-        "tvmaze_director": 0.95,
-        "tvmaze_creator": 0.9,
-        "tvmaze_producer": 0.84,
-        "wikipedia": 0.9,
-        "wikidata_director": 0.88,
-        "wikidata_creator": 0.84,
-        "wikidata_producer": 0.8,
-    }.get(source, 0.0)
+def confidence(role: str, source: str, exact_title: bool) -> float:
+    base = ROLE_CONFIG[role]["source_bases"].get(source, 0.0)
     return base + (0.02 if exact_title else 0.0)
 
 
@@ -307,21 +325,14 @@ def resolve_director_candidates(candidates: List[Dict[str, str]]) -> str:
 
 
 def source_priority_label(source: str) -> int:
-    return {
-        "tvmaze_director": 0,
-        "wikipedia": 1,
-        "wikidata_director": 2,
-        "tvmaze_creator": 3,
-        "wikidata_creator": 4,
-        "tvmaze_producer": 5,
-        "wikidata_producer": 6,
-    }.get(source, 99)
+    return {"tvmaze": 0, "wikipedia": 1, "wikidata": 2}.get(source, 99)
 
 
 async def lookup_wikidata_credit(
     session: aiohttp.ClientSession,
     sem: asyncio.Semaphore,
     title: str,
+    role: str,
     props: List[str],
 ) -> str:
     title_norm = normalize(title)
@@ -351,15 +362,15 @@ async def lookup_wikidata_credit(
 
 
 async def lookup_wikidata_director(session: aiohttp.ClientSession, sem: asyncio.Semaphore, title: str) -> str:
-    return await lookup_wikidata_credit(session, sem, title, ["P57"])
+    return await lookup_wikidata_credit(session, sem, title, "director", ["P57"])
 
 
 async def lookup_wikidata_creator(session: aiohttp.ClientSession, sem: asyncio.Semaphore, title: str) -> str:
-    return await lookup_wikidata_credit(session, sem, title, ["P170"])
+    return await lookup_wikidata_credit(session, sem, title, "creator", ["P170"])
 
 
 async def lookup_wikidata_producer(session: aiohttp.ClientSession, sem: asyncio.Semaphore, title: str) -> str:
-    return await lookup_wikidata_credit(session, sem, title, ["P162"])
+    return await lookup_wikidata_credit(session, sem, title, "producer", ["P162"])
 
 
 async def directors_from_wikipedia(session: aiohttp.ClientSession, sem: asyncio.Semaphore, title: str) -> str:
@@ -371,8 +382,31 @@ async def directors_from_wikipedia(session: aiohttp.ClientSession, sem: asyncio.
     if not wikitext:
         return ""
 
-    director = parse_director_from_wikitext(wikitext)
-    return director
+    return parse_wikipedia_role(wikitext, "director")
+
+
+async def creators_from_wikipedia(session: aiohttp.ClientSession, sem: asyncio.Semaphore, title: str) -> str:
+    page_title = await wikipedia_page_title(session, sem, title)
+    if not page_title:
+        return ""
+
+    wikitext = await wikipedia_wikitext(session, sem, page_title)
+    if not wikitext:
+        return ""
+
+    return parse_wikipedia_role(wikitext, "creator")
+
+
+async def producers_from_wikipedia(session: aiohttp.ClientSession, sem: asyncio.Semaphore, title: str) -> str:
+    page_title = await wikipedia_page_title(session, sem, title)
+    if not page_title:
+        return ""
+
+    wikitext = await wikipedia_wikitext(session, sem, page_title)
+    if not wikitext:
+        return ""
+
+    return parse_wikipedia_role(wikitext, "producer")
 
 
 async def directors_from_tvmaze(session: aiohttp.ClientSession, sem: asyncio.Semaphore, title: str) -> str:
@@ -388,7 +422,7 @@ async def directors_from_tvmaze(session: aiohttp.ClientSession, sem: asyncio.Sem
     if not crew:
         return ""
 
-    role_priority = ["Director", "Series Director", "Episode Director", "Creator", "Producer", "Executive Producer"]
+    role_priority = ROLE_CONFIG["director"]["tvmaze_roles"]
     ranked = []
     for member in crew:
         crew_type = str(member.get("type", "")).strip()
@@ -413,6 +447,56 @@ async def directors_from_tvmaze(session: aiohttp.ClientSession, sem: asyncio.Sem
                 break
         return ", ".join(names)
 
+    return ""
+
+
+async def creators_from_tvmaze(session: aiohttp.ClientSession, sem: asyncio.Semaphore, title: str) -> str:
+    show = await tvmaze_best_match(session, sem, title)
+    if not show:
+        return ""
+
+    show_id = show.get("id")
+    if not isinstance(show_id, int):
+        return ""
+
+    crew = await tvmaze_crew(session, sem, show_id)
+    if not crew:
+        return ""
+
+    names = []
+    for member in crew:
+        crew_type = str(member.get("type", "")).strip()
+        person_name = str(member.get("person", {}).get("name", "")).strip()
+        if crew_type == "Creator" and person_name:
+            names.append(person_name)
+
+    if names:
+        return ", ".join(dict.fromkeys(names[:3]))
+    return ""
+
+
+async def producers_from_tvmaze(session: aiohttp.ClientSession, sem: asyncio.Semaphore, title: str) -> str:
+    show = await tvmaze_best_match(session, sem, title)
+    if not show:
+        return ""
+
+    show_id = show.get("id")
+    if not isinstance(show_id, int):
+        return ""
+
+    crew = await tvmaze_crew(session, sem, show_id)
+    if not crew:
+        return ""
+
+    names = []
+    for member in crew:
+        crew_type = str(member.get("type", "")).strip()
+        person_name = str(member.get("person", {}).get("name", "")).strip()
+        if crew_type in {"Producer", "Executive Producer"} and person_name:
+            names.append(person_name)
+
+    if names:
+        return ", ".join(dict.fromkeys(names[:3]))
     return ""
 
 
@@ -478,82 +562,129 @@ def save_progress(title_to_director: Dict[str, str]) -> None:
         json.dump(title_to_director, f, ensure_ascii=False)
 
 
-async def lookup_title_director(session: aiohttp.ClientSession, sem: asyncio.Semaphore, title: str) -> str:
+async def lookup_title_credits(session: aiohttp.ClientSession, sem: asyncio.Semaphore, title: str) -> Dict[str, str]:
     try:
-        return await find_directors_for_title(session, sem, title)
+        return await find_credits_for_title(session, sem, title)
     except Exception:
-        return ""
+        return {"director": "", "creator": "", "producer": ""}
 
 
-async def find_directors_for_title(session: aiohttp.ClientSession, sem: asyncio.Semaphore, title: str) -> str:
+async def find_credits_for_title(session: aiohttp.ClientSession, sem: asyncio.Semaphore, title: str) -> Dict[str, str]:
     if not isinstance(title, str) or not title.strip():
-        return ""
+        return {"director": "", "creator": "", "producer": ""}
 
     title_norm = normalize(title)
 
-    tvmaze_task = asyncio.create_task(directors_from_tvmaze(session, sem, title))
-    wikipedia_task = asyncio.create_task(directors_from_wikipedia(session, sem, title))
-    wikidata_task = asyncio.create_task(lookup_wikidata_director(session, sem, title))
+    tvmaze_director_task = asyncio.create_task(directors_from_tvmaze(session, sem, title))
+    wikipedia_director_task = asyncio.create_task(directors_from_wikipedia(session, sem, title))
+    wikidata_director_task = asyncio.create_task(lookup_wikidata_director(session, sem, title))
 
-    tvmaze_director, wikipedia_director, wikidata_director = await asyncio.gather(
-        tvmaze_task, wikipedia_task, wikidata_task
+    tvmaze_creator_task = asyncio.create_task(creators_from_tvmaze(session, sem, title))
+    wikipedia_creator_task = asyncio.create_task(creators_from_wikipedia(session, sem, title))
+    wikidata_creator_task = asyncio.create_task(lookup_wikidata_creator(session, sem, title))
+
+    tvmaze_producer_task = asyncio.create_task(producers_from_tvmaze(session, sem, title))
+    wikipedia_producer_task = asyncio.create_task(producers_from_wikipedia(session, sem, title))
+    wikidata_producer_task = asyncio.create_task(lookup_wikidata_producer(session, sem, title))
+
+    (
+        tvmaze_director,
+        wikipedia_director,
+        wikidata_director,
+        tvmaze_creator,
+        wikipedia_creator,
+        wikidata_creator,
+        tvmaze_producer,
+        wikipedia_producer,
+        wikidata_producer,
+    ) = await asyncio.gather(
+        tvmaze_director_task,
+        wikipedia_director_task,
+        wikidata_director_task,
+        tvmaze_creator_task,
+        wikipedia_creator_task,
+        wikidata_creator_task,
+        tvmaze_producer_task,
+        wikipedia_producer_task,
+        wikidata_producer_task,
     )
 
-    candidates = [
-        {
-            "source": "tvmaze",
-            "value": tvmaze_director,
-            "confidence": director_confidence("tvmaze", normalize(tvmaze_director) == title_norm),
-        },
-        {
-            "source": "wikipedia",
-            "value": wikipedia_director,
-            "confidence": director_confidence("wikipedia", normalize(wikipedia_director) == title_norm),
-        },
-        {
-            "source": "wikidata",
-            "value": wikidata_director,
-            "confidence": director_confidence("wikidata", normalize(wikidata_director) == title_norm),
-        },
-    ]
+    def build_candidates(role: str, values: List[tuple]) -> List[Dict[str, str]]:
+        candidates = []
+        for source, value in values:
+            candidates.append(
+                {
+                    "source": source,
+                    "value": value,
+                    "confidence": confidence(role, source, normalize(value) == title_norm),
+                }
+            )
+        return candidates
 
-    resolved = resolve_director_candidates(candidates)
-    if resolved:
-        return resolved
+    director = resolve_director_candidates(
+        build_candidates(
+            "director",
+            [
+                ("tvmaze", tvmaze_director),
+                ("wikipedia", wikipedia_director),
+                ("wikidata", wikidata_director),
+            ],
+        )
+    )
+    creator = resolve_director_candidates(
+        build_candidates(
+            "creator",
+            [
+                ("tvmaze", tvmaze_creator),
+                ("wikipedia", wikipedia_creator),
+                ("wikidata", wikidata_creator),
+            ],
+        )
+    )
+    producer = resolve_director_candidates(
+        build_candidates(
+            "producer",
+            [
+                ("tvmaze", tvmaze_producer),
+                ("wikipedia", wikipedia_producer),
+                ("wikidata", wikidata_producer),
+            ],
+        )
+    )
 
-    return ""
+    return {"director": director, "creator": creator, "producer": producer}
 
 
-async def build_director_map(unique_titles: List[str]) -> Dict[str, str]:
-    title_to_director: Dict[str, str] = {}
+async def build_credit_map(unique_titles: List[str]) -> Dict[str, Dict[str, str]]:
+    title_to_credit: Dict[str, Dict[str, str]] = {}
     total = len(unique_titles)
     pending_titles = list(unique_titles)
 
     if os.path.exists(PROGRESS_FILE):
         with open(PROGRESS_FILE, "r", encoding="utf-8") as f:
-            title_to_director = json.load(f)
-        pending_titles = [title for title in unique_titles if title not in title_to_director]
+            title_to_credit = json.load(f)
+        pending_titles = [title for title in unique_titles if title not in title_to_credit]
 
     if not pending_titles:
-        return title_to_director
+        return title_to_credit
 
     timeout = aiohttp.ClientTimeout(total=30)
     connector = aiohttp.TCPConnector(limit=MAX_CONCURRENT_REQUESTS, ttl_dns_cache=300)
     sem = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
 
     async with aiohttp.ClientSession(headers=HEADERS, timeout=timeout, connector=connector) as session:
-        tasks = [asyncio.create_task(lookup_title_director(session, sem, title)) for title in pending_titles]
+        tasks = [asyncio.create_task(lookup_title_credits(session, sem, title)) for title in pending_titles]
         results = await asyncio.gather(*tasks)
 
-        for index, (title, director) in enumerate(zip(pending_titles, results), start=1):
-            title_to_director[title] = director
+        for index, (title, credits) in enumerate(zip(pending_titles, results), start=1):
+            title_to_credit[title] = credits
             current = total - len(pending_titles) + index
             if current % CHECKPOINT_EVERY == 0 or current == total:
                 print(f"Processed {current}/{total}")
-                save_progress(title_to_director)
+                save_progress(title_to_credit)
 
-    save_progress(title_to_director)
-    return title_to_director
+    save_progress(title_to_credit)
+    return title_to_credit
 
 
 async def main() -> None:
@@ -568,17 +699,19 @@ async def main() -> None:
     if title_col is None:
         raise ValueError("Could not find a 'title' column in missing_director.csv")
 
-    unique_titles = (
-        df[title_col].dropna().astype(str).str.strip().replace("", pd.NA).dropna().unique()
-    )
+    unique_titles = df[title_col].dropna().astype(str).str.strip().replace("", pd.NA).dropna().unique()
 
-    title_to_director = await build_director_map(list(unique_titles))
+    title_to_credit = await build_credit_map(list(unique_titles))
 
-    df["director"] = df[title_col].astype(str).map(title_to_director).fillna("")
+    df["director"] = df[title_col].astype(str).map(lambda t: title_to_credit.get(t, {}).get("director", "")).fillna("")
+    df["creator"] = df[title_col].astype(str).map(lambda t: title_to_credit.get(t, {}).get("creator", "")).fillna("")
+    df["producer"] = df[title_col].astype(str).map(lambda t: title_to_credit.get(t, {}).get("producer", "")).fillna("")
     df.to_csv(OUTPUT_CSV, index=False)
 
-    matched = (df["director"].astype(str).str.strip() != "").sum()
-    print(f"Done. Matched directors for {matched} of {len(df)} rows.")
+    director_matched = (df["director"].astype(str).str.strip() != "").sum()
+    creator_matched = (df["creator"].astype(str).str.strip() != "").sum()
+    producer_matched = (df["producer"].astype(str).str.strip() != "").sum()
+    print(f"Done. Matched directors for {director_matched} rows, creators for {creator_matched} rows, producers for {producer_matched} rows out of {len(df)}.")
 
 
 if __name__ == "__main__":
