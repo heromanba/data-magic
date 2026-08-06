@@ -207,6 +207,10 @@ def parse_director_from_wikitext(wikitext: str) -> str:
         r"\|\s*directors\s*=\s*([^\n\|]+)",
         r"\|\s*director1\s*=\s*([^\n\|]+)",
         r"\|\s*directed by\s*=\s*([^\n\|]+)",
+        r"\|\s*creator\s*=\s*([^\n\|]+)",
+        r"\|\s*creators\s*=\s*([^\n\|]+)",
+        r"\|\s*producer\s*=\s*([^\n\|]+)",
+        r"\|\s*producers\s*=\s*([^\n\|]+)",
         r"\|\s*written by\s*=\s*([^\n\|]+)",
     ]
     for pattern in patterns:
@@ -261,7 +265,15 @@ def is_valid_director_value(value: str) -> bool:
 
 
 def director_confidence(source: str, exact_title: bool) -> float:
-    base = {"tvmaze": 0.95, "wikipedia": 0.9, "wikidata": 0.88}.get(source, 0.0)
+    base = {
+        "tvmaze_director": 0.95,
+        "tvmaze_creator": 0.9,
+        "tvmaze_producer": 0.84,
+        "wikipedia": 0.9,
+        "wikidata_director": 0.88,
+        "wikidata_creator": 0.84,
+        "wikidata_producer": 0.8,
+    }.get(source, 0.0)
     return base + (0.02 if exact_title else 0.0)
 
 
@@ -294,7 +306,24 @@ def resolve_director_candidates(candidates: List[Dict[str, str]]) -> str:
     return ""
 
 
-async def lookup_wikidata_director(session: aiohttp.ClientSession, sem: asyncio.Semaphore, title: str) -> str:
+def source_priority_label(source: str) -> int:
+    return {
+        "tvmaze_director": 0,
+        "wikipedia": 1,
+        "wikidata_director": 2,
+        "tvmaze_creator": 3,
+        "wikidata_creator": 4,
+        "tvmaze_producer": 5,
+        "wikidata_producer": 6,
+    }.get(source, 99)
+
+
+async def lookup_wikidata_credit(
+    session: aiohttp.ClientSession,
+    sem: asyncio.Semaphore,
+    title: str,
+    props: List[str],
+) -> str:
     title_norm = normalize(title)
     candidate_ids = await search_entities(session, sem, title)
     if not candidate_ids:
@@ -311,14 +340,26 @@ async def lookup_wikidata_director(session: aiohttp.ClientSession, sem: asyncio.
             rest.append(cid)
 
     for cid in exact_first + rest:
-        director_ids = await get_director_ids(session, sem, cid)
-        if director_ids:
-            labels_map = await get_labels(session, sem, director_ids)
-            names = [normalize_director_value(labels_map.get(did, "")) for did in director_ids]
+        credit_ids = await get_wikidata_ids(session, sem, cid, props)
+        if credit_ids:
+            labels_map = await get_labels(session, sem, credit_ids)
+            names = [normalize_director_value(labels_map.get(did, "")) for did in credit_ids]
             names = [n for n in names if is_valid_director_value(n)]
             if names:
                 return ", ".join(dict.fromkeys(names))
     return ""
+
+
+async def lookup_wikidata_director(session: aiohttp.ClientSession, sem: asyncio.Semaphore, title: str) -> str:
+    return await lookup_wikidata_credit(session, sem, title, ["P57"])
+
+
+async def lookup_wikidata_creator(session: aiohttp.ClientSession, sem: asyncio.Semaphore, title: str) -> str:
+    return await lookup_wikidata_credit(session, sem, title, ["P170"])
+
+
+async def lookup_wikidata_producer(session: aiohttp.ClientSession, sem: asyncio.Semaphore, title: str) -> str:
+    return await lookup_wikidata_credit(session, sem, title, ["P162"])
 
 
 async def directors_from_wikipedia(session: aiohttp.ClientSession, sem: asyncio.Semaphore, title: str) -> str:
@@ -347,7 +388,7 @@ async def directors_from_tvmaze(session: aiohttp.ClientSession, sem: asyncio.Sem
     if not crew:
         return ""
 
-    role_priority = ["Director", "Series Director", "Episode Director"]
+    role_priority = ["Director", "Series Director", "Episode Director", "Creator", "Producer", "Executive Producer"]
     ranked = []
     for member in crew:
         crew_type = str(member.get("type", "")).strip()
@@ -375,7 +416,7 @@ async def directors_from_tvmaze(session: aiohttp.ClientSession, sem: asyncio.Sem
     return ""
 
 
-async def get_director_ids(session: aiohttp.ClientSession, sem: asyncio.Semaphore, entity_id: str) -> List[str]:
+async def get_wikidata_ids(session: aiohttp.ClientSession, sem: asyncio.Semaphore, entity_id: str, props: List[str]) -> List[str]:
     if entity_id in entity_claim_cache:
         return entity_claim_cache[entity_id]
 
@@ -394,14 +435,14 @@ async def get_director_ids(session: aiohttp.ClientSession, sem: asyncio.Semaphor
     entity = data.get("entities", {}).get(entity_id, {})
 
     claims = entity.get("claims", {})
-    p57 = claims.get("P57", [])  # director
     director_ids = []
-    for claim in p57:
-        mainsnak = claim.get("mainsnak", {})
-        datavalue = mainsnak.get("datavalue", {})
-        value = datavalue.get("value", {})
-        if isinstance(value, dict) and value.get("id"):
-            director_ids.append(value["id"])
+    for prop in props:
+        for claim in claims.get(prop, []):
+            mainsnak = claim.get("mainsnak", {})
+            datavalue = mainsnak.get("datavalue", {})
+            value = datavalue.get("value", {})
+            if isinstance(value, dict) and value.get("id"):
+                director_ids.append(value["id"])
 
     entity_claim_cache[entity_id] = director_ids
     return director_ids
