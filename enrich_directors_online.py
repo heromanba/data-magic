@@ -15,6 +15,7 @@ MAX_CONCURRENT_REQUESTS = 32
 CHECKPOINT_EVERY = 100
 
 API_URL = "https://www.wikidata.org/w/api.php"
+WIKIPEDIA_API_URL = "https://en.wikipedia.org/w/api.php"
 HEADERS = {"User-Agent": "data-magic-director-enricher/1.0 (local-script)"}
 
 
@@ -24,6 +25,8 @@ entity_claim_cache: Dict[str, List[str]] = {}
 label_cache: Dict[str, str] = {}
 tvmaze_search_cache: Dict[str, Dict] = {}
 tvmaze_crew_cache: Dict[int, List[Dict]] = {}
+wikipedia_search_cache: Dict[str, str] = {}
+wikipedia_extract_cache: Dict[str, str] = {}
 
 
 def normalize(text: str) -> str:
@@ -114,6 +117,223 @@ async def tvmaze_crew(session: aiohttp.ClientSession, sem: asyncio.Semaphore, sh
     return crew
 
 
+async def wikipedia_page_title(session: aiohttp.ClientSession, sem: asyncio.Semaphore, title: str) -> str:
+    if title in wikipedia_search_cache:
+        return wikipedia_search_cache[title]
+
+    params = {
+        "action": "query",
+        "format": "json",
+        "list": "search",
+        "srsearch": title,
+        "srlimit": 5,
+        "srprop": "",
+    }
+    data = await get_json(session, sem, WIKIPEDIA_API_URL, params=params)
+    if not data:
+        wikipedia_search_cache[title] = ""
+        return ""
+
+    results = data.get("query", {}).get("search", [])
+    if not results:
+        wikipedia_search_cache[title] = ""
+        return ""
+
+    title_norm = normalize(title)
+    best = ""
+    best_score = 0.0
+    for item in results:
+        candidate = item.get("title", "")
+        if not candidate:
+            continue
+        score = similarity(title, candidate)
+        if normalize(candidate) == title_norm:
+            best = candidate
+            break
+        if score > best_score:
+            best_score = score
+            best = candidate
+
+    wikipedia_search_cache[title] = best
+    return best
+
+
+async def wikipedia_wikitext(session: aiohttp.ClientSession, sem: asyncio.Semaphore, page_title: str) -> str:
+    if page_title in wikipedia_extract_cache:
+        return wikipedia_extract_cache[page_title]
+
+    params = {
+        "action": "query",
+        "format": "json",
+        "prop": "revisions",
+        "rvprop": "content",
+        "rvslots": "main",
+        "titles": page_title,
+        "redirects": 1,
+    }
+    data = await get_json(session, sem, WIKIPEDIA_API_URL, params=params)
+    if not data:
+        wikipedia_extract_cache[page_title] = ""
+        return ""
+
+    pages = data.get("query", {}).get("pages", {})
+    if not pages:
+        wikipedia_extract_cache[page_title] = ""
+        return ""
+
+    page = next(iter(pages.values()))
+    revisions = page.get("revisions", [])
+    if not revisions:
+        wikipedia_extract_cache[page_title] = ""
+        return ""
+
+    revision = revisions[0]
+    text = ""
+    if "slots" in revision:
+        text = revision.get("slots", {}).get("main", {}).get("*", "")
+    else:
+        text = revision.get("*", "")
+
+    wikipedia_extract_cache[page_title] = text
+    return text
+
+
+def parse_director_from_wikitext(wikitext: str) -> str:
+    if not wikitext:
+        return ""
+
+    patterns = [
+        r"\|\s*director\s*=\s*([^\n\|]+)",
+        r"\|\s*directors\s*=\s*([^\n\|]+)",
+        r"\|\s*director1\s*=\s*([^\n\|]+)",
+        r"\|\s*directed by\s*=\s*([^\n\|]+)",
+        r"\|\s*written by\s*=\s*([^\n\|]+)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, wikitext, flags=re.IGNORECASE)
+        if match:
+            value = match.group(1)
+            value = re.sub(r"<ref[^>]*>.*?</ref>", "", value, flags=re.IGNORECASE | re.DOTALL)
+            value = re.sub(r"<[^>]+>", "", value)
+            value = re.sub(r"\[\[(?:[^\]|]+\|)?([^\]]+)\]\]", r"\1", value)
+            value = value.replace("{{", "").replace("}}", "")
+            value = value.replace("\n", " ")
+            value = re.sub(r"\s+", " ", value).strip()
+            value = value.strip(" ,;")
+            if value:
+                return value
+
+    return ""
+
+
+def normalize_director_value(value: str) -> str:
+    value = re.sub(r"\s+", " ", value or "").strip()
+    value = value.strip(" ,;:.-")
+    value = re.sub(r"\[\[([^\]|]+\|)?([^\]]+)\]\]", r"\2", value)
+    value = re.sub(r"<[^>]+>", "", value)
+    return value
+
+
+def is_valid_director_value(value: str) -> bool:
+    if not value:
+        return False
+    if len(value) > 160:
+        return False
+
+    lowered = value.lower()
+    blocked = [
+        "director",
+        "creator",
+        "executive producer",
+        "written by",
+        "story by",
+        "unknown",
+        "n/a",
+        "tba",
+        "various",
+        "multiple",
+    ]
+    if any(token in lowered for token in blocked):
+        return False
+    if re.search(r"\b(19|20)\d{2}\b", lowered):
+        return False
+    return True
+
+
+def director_confidence(source: str, exact_title: bool) -> float:
+    base = {"tvmaze": 0.95, "wikipedia": 0.9, "wikidata": 0.88}.get(source, 0.0)
+    return base + (0.02 if exact_title else 0.0)
+
+
+def resolve_director_candidates(candidates: List[Dict[str, str]]) -> str:
+    valid = []
+    for candidate in candidates:
+        value = normalize_director_value(candidate.get("value", ""))
+        if is_valid_director_value(value):
+            valid.append({**candidate, "value": value})
+
+    if not valid:
+        return ""
+
+    grouped: Dict[str, List[Dict[str, str]]] = {}
+    for candidate in valid:
+        grouped.setdefault(candidate["value"], []).append(candidate)
+
+    consensus_value, consensus_group = max(
+        grouped.items(),
+        key=lambda item: (len(item[1]), max(c["confidence"] for c in item[1])),
+    )
+    if len(consensus_group) >= 2:
+        return consensus_value
+
+    ordered = sorted(valid, key=lambda c: c["confidence"], reverse=True)
+    best = ordered[0]
+    if best["confidence"] >= 0.9:
+        if len(ordered) == 1 or ordered[1]["value"] == best["value"]:
+            return best["value"]
+    return ""
+
+
+async def lookup_wikidata_director(session: aiohttp.ClientSession, sem: asyncio.Semaphore, title: str) -> str:
+    title_norm = normalize(title)
+    candidate_ids = await search_entities(session, sem, title)
+    if not candidate_ids:
+        return ""
+
+    candidate_labels = await get_labels(session, sem, candidate_ids)
+    exact_first = []
+    rest = []
+    for cid in candidate_ids:
+        label = candidate_labels.get(cid, "")
+        if normalize(label) == title_norm:
+            exact_first.append(cid)
+        else:
+            rest.append(cid)
+
+    for cid in exact_first + rest:
+        director_ids = await get_director_ids(session, sem, cid)
+        if director_ids:
+            labels_map = await get_labels(session, sem, director_ids)
+            names = [normalize_director_value(labels_map.get(did, "")) for did in director_ids]
+            names = [n for n in names if is_valid_director_value(n)]
+            if names:
+                return ", ".join(dict.fromkeys(names))
+    return ""
+
+
+async def directors_from_wikipedia(session: aiohttp.ClientSession, sem: asyncio.Semaphore, title: str) -> str:
+    page_title = await wikipedia_page_title(session, sem, title)
+    if not page_title:
+        return ""
+
+    wikitext = await wikipedia_wikitext(session, sem, page_title)
+    if not wikitext:
+        return ""
+
+    director = parse_director_from_wikitext(wikitext)
+    return director
+
+
 async def directors_from_tvmaze(session: aiohttp.ClientSession, sem: asyncio.Semaphore, title: str) -> str:
     show = await tvmaze_best_match(session, sem, title)
     if not show:
@@ -127,7 +347,7 @@ async def directors_from_tvmaze(session: aiohttp.ClientSession, sem: asyncio.Sem
     if not crew:
         return ""
 
-    role_priority = ["Director", "Series Director", "Episode Director", "Creator", "Executive Producer"]
+    role_priority = ["Director", "Series Director", "Episode Director"]
     ranked = []
     for member in crew:
         crew_type = str(member.get("type", "")).strip()
@@ -175,10 +395,8 @@ async def get_director_ids(session: aiohttp.ClientSession, sem: asyncio.Semaphor
 
     claims = entity.get("claims", {})
     p57 = claims.get("P57", [])  # director
-    p170 = claims.get("P170", [])  # creator
-
     director_ids = []
-    for claim in p57 + p170:
+    for claim in p57:
         mainsnak = claim.get("mainsnak", {})
         datavalue = mainsnak.get("datavalue", {})
         value = datavalue.get("value", {})
@@ -230,39 +448,37 @@ async def find_directors_for_title(session: aiohttp.ClientSession, sem: asyncio.
     if not isinstance(title, str) or not title.strip():
         return ""
 
-    from_tvmaze = await directors_from_tvmaze(session, sem, title)
-    if from_tvmaze:
-        return from_tvmaze
-
     title_norm = normalize(title)
-    candidate_ids = await search_entities(session, sem, title)
 
-    if not candidate_ids:
-        return ""
+    tvmaze_task = asyncio.create_task(directors_from_tvmaze(session, sem, title))
+    wikipedia_task = asyncio.create_task(directors_from_wikipedia(session, sem, title))
+    wikidata_task = asyncio.create_task(lookup_wikidata_director(session, sem, title))
 
-    # prioritize candidates with exact normalized label match when possible
-    exact_first = []
-    rest = []
+    tvmaze_director, wikipedia_director, wikidata_director = await asyncio.gather(
+        tvmaze_task, wikipedia_task, wikidata_task
+    )
 
-    # fetch candidate labels in one batch for ranking
-    candidate_labels = await get_labels(session, sem, candidate_ids)
-    for cid in candidate_ids:
-        label = candidate_labels.get(cid, "")
-        if normalize(label) == title_norm:
-            exact_first.append(cid)
-        else:
-            rest.append(cid)
+    candidates = [
+        {
+            "source": "tvmaze",
+            "value": tvmaze_director,
+            "confidence": director_confidence("tvmaze", normalize(tvmaze_director) == title_norm),
+        },
+        {
+            "source": "wikipedia",
+            "value": wikipedia_director,
+            "confidence": director_confidence("wikipedia", normalize(wikipedia_director) == title_norm),
+        },
+        {
+            "source": "wikidata",
+            "value": wikidata_director,
+            "confidence": director_confidence("wikidata", normalize(wikidata_director) == title_norm),
+        },
+    ]
 
-    ordered_candidates = exact_first + rest
-
-    for cid in ordered_candidates:
-        director_ids = await get_director_ids(session, sem, cid)
-        if director_ids:
-            labels_map = await get_labels(session, sem, director_ids)
-            names = [labels_map.get(did, "").strip() for did in director_ids]
-            names = [n for n in names if n]
-            if names:
-                return ", ".join(dict.fromkeys(names))
+    resolved = resolve_director_candidates(candidates)
+    if resolved:
+        return resolved
 
     return ""
 
