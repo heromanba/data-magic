@@ -1,0 +1,12 @@
+[project]
+name = "abc-trading-python"
+version = "0.1.0"
+description = "Python support for abc-trading"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = []
+
+[build-system]
+requires = ["setuptools>=61.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
